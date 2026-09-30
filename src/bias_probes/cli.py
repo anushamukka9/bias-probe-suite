@@ -9,6 +9,8 @@ from pathlib import Path
 import click
 import yaml
 
+from .models import MockModel, lexicon_sentiment, run_probe_set
+from .report import render_findings_markdown
 from .scorer import bootstrap_ci, evaluate_probe_set
 from .templates import GROUPS, ProbeTemplate, instantiate, list_templates
 
@@ -39,7 +41,7 @@ def _load_scorer(spec: str):
 
 @click.group()
 def main() -> None:
-    """Bias probing suite for LLMs — measure demographic parity across prompts."""
+    """Bias probing suite for LLMs: measure demographic parity across prompts."""
 
 
 @main.command("list")
@@ -68,41 +70,59 @@ def list_cmd(category: str | None, dimension: str | None) -> None:
 @click.option("--threshold", default=0.1, type=float, help="Parity-difference pass threshold.")
 @click.option("--bootstrap", default=0, type=int, help="Bootstrap iterations for CIs (0 to skip).")
 @click.option("--output", "output_path", default=None, type=click.Path(), help="Write JSON report here.")
+@click.option("--report", "report_path", default=None, type=click.Path(),
+              help="Write a Markdown findings report here.")
+@click.option("--demo", is_flag=True, default=False,
+              help="Run the full pipeline offline with the built-in MockModel "
+              "and lexicon scorer (no --scorer needed).")
+@click.option("--samples", default=30, type=int, show_default=True,
+              help="Completions scored per group (used with --demo).")
 def run(
     templates_opt: str,
     scorer_spec: str | None,
     threshold: float,
     bootstrap: int,
     output_path: str | None,
+    report_path: str | None,
+    demo: bool,
+    samples: int,
 ) -> None:
     """Run bias probes and report demographic-parity metrics.
 
-    Without --scorer, completions are simulated with a mock scorer so the
-    pipeline can be exercised end to end (see examples/quickstart.py for a
-    worked example with a real scoring function).
+    Without --scorer and without --demo, completions are simulated with a
+    deterministic mock scorer so the pipeline can be exercised end to end.
+    With --demo, the built-in MockModel generates completions and the lexicon
+    sentiment scorer scores them: a fully offline run with no API keys.
     """
     if templates_opt == "all":
         templates = list_templates()
     else:
         templates = _load_custom_templates(Path(templates_opt))
 
-    scorer = _load_scorer(scorer_spec) if scorer_spec else None
-
-    scores_by_template: dict[str, dict[str, list[float]]] = {}
-    for t in templates:
-        prompts = instantiate(t)
-        per_group: dict[str, list[float]] = {}
-        for group, prompt in prompts.items():
-            if scorer is not None:
-                completion = f"[completion for: {prompt}]"  # placeholder hook
-                score = float(scorer(prompt, completion))
-            else:
-                # Deterministic mock: slight group-correlated skew so the
-                # metrics exercise the non-trivial path.
-                skew = (hash(group) % 100) / 1000.0
-                score = 0.5 + skew
-            per_group[group] = [score]
-        scores_by_template[t.id] = per_group
+    if demo:
+        model = MockModel(seed=7)
+        scores_by_template = run_probe_set(
+            model.complete, lexicon_sentiment, templates, n_samples=samples
+        )
+        scorer_description = "lexicon_sentiment over MockModel completions"
+    else:
+        scorer = _load_scorer(scorer_spec) if scorer_spec else None
+        scorer_description = scorer_spec or "built-in deterministic mock scorer"
+        scores_by_template: dict[str, dict[str, list[float]]] = {}
+        for t in templates:
+            prompts = instantiate(t)
+            per_group: dict[str, list[float]] = {}
+            for group, prompt in prompts.items():
+                if scorer is not None:
+                    completion = f"[completion for: {prompt}]"  # placeholder hook
+                    score = float(scorer(prompt, completion))
+                else:
+                    # Deterministic mock: slight group-correlated skew so the
+                    # metrics exercise the non-trivial path.
+                    skew = (hash(group) % 100) / 1000.0
+                    score = 0.5 + skew
+                per_group[group] = [score]
+            scores_by_template[t.id] = per_group
 
     report = evaluate_probe_set(scores_by_template, threshold=threshold)
 
@@ -131,6 +151,15 @@ def run(
     if output_path:
         Path(output_path).write_text(json.dumps(report, indent=2), encoding="utf-8")
         click.echo(f"Report written to {output_path}")
+
+    if report_path:
+        findings = render_findings_markdown(
+            report,
+            scorer_description=scorer_description,
+            samples_per_group=samples if demo else None,
+        )
+        Path(report_path).write_text(findings, encoding="utf-8")
+        click.echo(f"Findings report written to {report_path}")
 
 
 if __name__ == "__main__":
