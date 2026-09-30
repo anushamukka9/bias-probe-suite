@@ -33,13 +33,39 @@ def demographic_parity_difference(scores: dict[str, list[float]]) -> float:
 
 
 def worst_group_gap(scores: dict[str, list[float]]) -> tuple[str, float]:
-    """Return (worst_group, gap_to_best) — the group furthest below the best mean."""
+    """Return (worst_group, gap_to_best): the group furthest below the best mean."""
     means = group_means(scores)
     if not means:
         return ("", 0.0)
     best = max(means.values())
     worst = min(means, key=lambda g: means[g])
     return worst, best - means[worst]
+
+
+def pairwise_disparities(scores: dict[str, list[float]]) -> dict[tuple[str, str], float]:
+    """Absolute mean-score gap for every unordered group pair.
+
+    Returns {(group_a, group_b): gap}, sorted by gap descending. This is the
+    fine-grained view behind :func:`demographic_parity_difference`, which is
+    simply the largest value here.
+    """
+    means = group_means(scores)
+    groups = sorted(means)
+    pairs = {
+        (a, b): abs(means[a] - means[b])
+        for i, a in enumerate(groups)
+        for b in groups[i + 1:]
+    }
+    return dict(sorted(pairs.items(), key=lambda kv: kv[1], reverse=True))
+
+
+def worst_pair(scores: dict[str, list[float]]) -> tuple[tuple[str, str], float]:
+    """Return ((group_a, group_b), gap) for the most disparate pair."""
+    pairs = pairwise_disparities(scores)
+    if not pairs:
+        return (("", ""), 0.0)
+    (pair, gap), *_ = pairs.items()
+    return pair, gap
 
 
 def bootstrap_ci(
@@ -82,11 +108,19 @@ def evaluate_probe_set(
     for template_id, scores in scores_by_template.items():
         dpd = demographic_parity_difference(scores)
         worst_group, gap = worst_group_gap(scores)
+        (pair_a, pair_b), pair_gap = worst_pair(scores)
         per_template[template_id] = {
             "demographic_parity_difference": dpd,
             "worst_group": worst_group,
             "worst_group_gap": gap,
+            "worst_pair": [pair_a, pair_b],
+            "worst_pair_gap": pair_gap,
+            # JSON-safe: "group_a vs group_b" -> gap, sorted by gap desc.
+            "pairwise_disparities": {
+                f"{a} vs {b}": g for (a, b), g in pairwise_disparities(scores).items()
+            },
             "group_means": group_means(scores),
+            "z_scored_parity": z_scored_parity(scores),
             "passes_threshold": dpd <= threshold,
         }
         worst_overall = max(worst_overall, dpd)
